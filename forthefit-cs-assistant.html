@@ -378,6 +378,12 @@ input::placeholder, textarea::placeholder { color: var(--ink-50); }
       <div class="settings-hint">How many recent rows to pull in as training context. 20–40 is ideal.</div>
     </div>
 
+    <div class="settings-field">
+      <label>Rich Returns API Key</label>
+      <input type="text" id="rich-returns-key" placeholder="your-rich-returns-api-key">
+      <div class="settings-hint">Found in your Rich Returns dashboard → Account → API Keys. Used to look up live return status for customer queries.</div>
+    </div>
+
     <div class="settings-actions">
       <button class="btn btn-ghost" onclick="closeSettings()">Cancel</button>
       <button class="btn btn-copy" onclick="saveSettings()">Save & Connect</button>
@@ -511,10 +517,11 @@ try { history = JSON.parse(localStorage.getItem('ftf_history') || '[]'); } catch
 // ── Settings ───────────────────────────────────────────────────────────────
 function openSettings() {
   const saved = loadSettings();
-  if (saved.sheetId) document.getElementById('sheet-id').value = saved.sheetId;
-  if (saved.apiKey)  document.getElementById('api-key').value  = saved.apiKey;
-  if (saved.tabName) document.getElementById('sheet-tab').value = saved.tabName;
-  if (saved.maxEx)   document.getElementById('max-examples').value = saved.maxEx;
+  if (saved.sheetId)        document.getElementById('sheet-id').value        = saved.sheetId;
+  if (saved.apiKey)         document.getElementById('api-key').value         = saved.apiKey;
+  if (saved.tabName)        document.getElementById('sheet-tab').value       = saved.tabName;
+  if (saved.maxEx)          document.getElementById('max-examples').value    = saved.maxEx;
+  if (saved.richReturnsKey) document.getElementById('rich-returns-key').value = saved.richReturnsKey;
   document.getElementById('settings-overlay').classList.add('open');
 }
 function closeSettings() { document.getElementById('settings-overlay').classList.remove('open'); }
@@ -522,10 +529,11 @@ function maybeCloseSettings(e) { if (e.target === document.getElementById('setti
 
 function saveSettings() {
   const s = {
-    sheetId: document.getElementById('sheet-id').value.trim(),
-    apiKey:  document.getElementById('api-key').value.trim(),
-    tabName: document.getElementById('sheet-tab').value.trim() || 'Training Log',
-    maxEx:   document.getElementById('max-examples').value.trim() || '30',
+    sheetId:        document.getElementById('sheet-id').value.trim(),
+    apiKey:         document.getElementById('api-key').value.trim(),
+    tabName:        document.getElementById('sheet-tab').value.trim() || 'Training Log',
+    maxEx:          document.getElementById('max-examples').value.trim() || '30',
+    richReturnsKey: document.getElementById('rich-returns-key').value.trim(),
   };
   localStorage.setItem('ftf_settings', JSON.stringify(s));
   closeSettings();
@@ -752,9 +760,67 @@ Tall Men's, Short Men's, Petite Women's, Tall Women's clothing.
 Materials: moisture-wicking poly, brushed fleece, premium flannel, jersey knit.
 Customer service email: customerservice@FORtheFIT.com
 
+=== RICH RETURNS DATA ===
+If Rich Returns data is provided, use it naturally. Reference the RMA number, status,
+and items. For status meanings:
+- Pending: customer submitted return, awaiting your approval
+- Approved: return approved, label may have been sent
+- Shipped: customer has sent the return
+- Received: return package received at warehouse
+- Resolved: return fully processed and closed
+If no return data is found, ask the customer to start a return at forthefit.com/pages/returns
+or provide their order number so you can look it up.
+
 RULES: Never invent order numbers, tracking numbers, or dates you weren't given.
 If you lack order info, ask the customer to provide their order number.
 Be empathetic with frustrated customers — acknowledge before explaining policy.`;
+
+// ── Rich Returns lookup ───────────────────────────────────────────────────
+async function lookupRichReturn(customerEmail) {
+  const s = loadSettings();
+  if (!s.richReturnsKey || !customerEmail) return null;
+  try {
+    // Use Cloudflare Worker as proxy to avoid CORS
+    const res = await fetch('https://forthefit-proxy.jeffdbova.workers.dev/rich-returns', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: customerEmail, apiKey: s.richReturnsKey })
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const returns = data.returns || data.data || [];
+    if (!returns.length) return null;
+    // Get most recent return
+    const r = returns[0];
+    return {
+      rma:         r.rma || r.id || '',
+      status:      r.status || '',
+      createdAt:   r.createdAt || r.created_at || '',
+      items:       (r.returnLineItems || r.items || []).map(i => i.name || i.title || i.sku || '').join(', '),
+      resolution:  r.resolution || '',
+      labelStatus: r.labelStatus || '',
+      refundAmount: r.refundAmount || '',
+    };
+  } catch(e) {
+    console.warn('Rich Returns lookup failed:', e.message);
+    return null;
+  }
+}
+
+function buildReturnBlock(returnData) {
+  if (!returnData) return '';
+  return `
+
+--- RICH RETURNS DATA ---
+RMA Number: ${returnData.rma}
+Return Status: ${returnData.status}
+Submitted: ${returnData.createdAt}
+Items Being Returned: ${returnData.items}
+Resolution: ${returnData.resolution || 'Pending'}
+Label Status: ${returnData.labelStatus || 'N/A'}
+Refund Amount: ${returnData.refundAmount || 'TBD'}
+-------------------------`;
+}
 
 // ── Generate reply ─────────────────────────────────────────────────────────
 async function generateReply() {
@@ -767,6 +833,16 @@ async function generateReply() {
   const catNote = selectedCat ? `\n(Topic: ${selectedCat})` : '';
   const ctxNote = ctx ? `\n\nExtra context: ${ctx}` : '';
   const trainingBlock = buildTrainingBlock();
+
+  // Look up Rich Returns data if this looks like a return question
+  let returnBlock = '';
+  const isReturnQuery = /\b(return|refund|exchange|rma|send back|sent back)\b/i.test(body);
+  const fromEmail = document.getElementById('from-field').value.trim();
+  if (isReturnQuery && fromEmail && fromEmail.includes('@')) {
+    const returnData = await lookupRichReturn(fromEmail);
+    returnBlock = buildReturnBlock(returnData);
+  }
+
   const systemPrompt = BASE_SYSTEM_PROMPT + trainingBlock;
 
   let userPrompt;
@@ -775,7 +851,7 @@ async function generateReply() {
 
 Customer name: ${from || 'Customer'}
 Chat transcript:
-${body}${catNote}${ctxNote}
+${body}${catNote}${ctxNote}${returnBlock}
 
 Write just your next reply message — short, warm, conversational. No sign-off needed for chat. Match the casual back-and-forth tone of a live chat.`;
   } else {
@@ -784,7 +860,7 @@ Write just your next reply message — short, warm, conversational. No sign-off 
 From: ${from || 'Customer'}
 Subject: ${subject || '(no subject)'}
 Message:
-${body}${catNote}${ctxNote}
+${body}${catNote}${ctxNote}${returnBlock}
 
 Write the reply body only — no subject line. Warm, casual tone. Sign off as "The ForTheFit Team".`;
   }
